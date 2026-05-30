@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="利回りウォッチャー 株価取得API",
     description="日本株の最新株価と配当利回りを取得するAPIサーバー",
-    version="1.1.1"
+    version="1.2.0"
 )
 
 # CORS設定（すべてのオリジンからのリクエストを許可）
@@ -24,6 +25,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# レスポンスのデータ構造を定義するPydanticモデル
+# これにより、APIスキーマ(Swagger/OpenAPI docs)で price と dividend_yield が明確に float (number) として定義されます
+class StockResponse(BaseModel):
+    code: str
+    price: float
+    dividend_yield: float
+    source: str
 
 def scrape_fallback(code: str):
     """
@@ -112,7 +121,7 @@ def scrape_fallback(code: str):
 def read_root():
     return {"message": "Yield Watcher API is running. Use /api/stock?code=XXXX to fetch stock data."}
 
-@app.get("/api/stock")
+@app.get("/api/stock", response_model=StockResponse)
 def get_stock(code: str = Query(..., description="銘柄コード (数字4桁、または末尾に.T付きのコード。例: 2914, 7203.T)")):
     """
     指定された銘柄コードの最新株価と配当利回りを取得します。
@@ -209,7 +218,7 @@ def get_stock(code: str = Query(..., description="銘柄コード (数字4桁、
             detail=f"銘柄コード {code} の株価データを取得できませんでした。コードが正しいか確認してください。"
         )
         
-    # float型であることを保証してJSONを返却
+    # float型であることを保証してレスポンススキーマに沿って返却
     return {
         "code": code.replace(".T", ""),
         "price": float(price),
