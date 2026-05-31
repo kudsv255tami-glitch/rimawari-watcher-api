@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="利回りウォッチャー 株価取得API",
     description="日本株の最新株価と配当利回りを取得するAPIサーバー",
-    version="1.3.0"
+    version="2.0.0"
 )
 
 # CORS設定（すべてのオリジンからのリクエストを許可）
@@ -27,8 +27,6 @@ app.add_middleware(
 )
 
 # レスポンスのデータ構造を定義するPydanticモデル
-# フロントエンド（app.js）の要求するキー名に完全に一致させています。
-# Pythonの予約語である "yield" を回避するため、Pydanticのエイリアス機能を使用しています。
 class StockResponse(BaseModel):
     code: str
     name: str
@@ -39,16 +37,10 @@ class StockResponse(BaseModel):
     yield_val: float = Field(default=0.0, serialization_alias="yield", validation_alias="yield")
     source: str
 
-def scrape_fallback(code: str):
+def scrape_yahoo_finance_japan(clean_code: str):
     """
-    yfinanceでデータが取得できなかった場合のフォールバックとして、
-    Yahoo!ファイナンス（日本）のHTMLをパースして株価、配当利回り、銘柄名などを取得します。
+    Yahoo!ファイナンス（日本）のHTMLをパースして、日本語銘柄名、リアルタイム株価、配当利回り、1株配当金を取得します。
     """
-    # 銘柄コードから数字部分のみを抽出 (例: 2914.T -> 2914)
-    clean_code = re.sub(r"\D", "", code)
-    if not clean_code:
-        return 0.0, 0.0, "", 0.0
-
     url = f"https://finance.yahoo.co.jp/quote/{clean_code}.T"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -68,11 +60,11 @@ def scrape_fallback(code: str):
             
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # --- 1. 銘柄名の取得 ---
+        # --- 1. 日本語銘柄名の取得 ---
         title_tag = soup.find('title')
         if title_tag:
             title_text = title_tag.get_text(strip=True)
-            # 「日本たばこ産業(株)【2914】...」から「日本たばこ産業(株)」を抽出
+            # 「日本たばこ産業(株)【2914】...」や「(株)極楽湯ホールディングス【135A】...」から日本語会社名を抽出
             name_match = re.search(r"^(.+?)(?:【|\()", title_text)
             if name_match:
                 name = name_match.group(1).strip()
@@ -115,13 +107,11 @@ def scrape_fallback(code: str):
                 logger.info(f"Price found in span class: {price}")
 
         # --- 4. 配当利回りの取得 ---
-        # 「配当利回り」というラベルを持つ要素を検索
         dt_tags = soup.find_all(['dt', 'th', 'td', 'span'], string=re.compile("配当利回り"))
         for dt in dt_tags:
             dd = dt.find_next(['dd', 'td'])
             if dd:
                 val_text = dd.get_text(strip=True)
-                # 「5.20%」などのテキストから数値を抽出
                 match = re.search(r"([\d\.]+)\s*%", val_text)
                 if match:
                     dividend_yield = float(match.group(1))
@@ -129,13 +119,11 @@ def scrape_fallback(code: str):
                     break
                     
         # --- 5. 1株配当金の取得 ---
-        # 「1株配当」というラベルを持つ要素を検索
         div_dt_tags = soup.find_all(['dt', 'th', 'td', 'span'], string=re.compile("1株配当"))
         for dt in div_dt_tags:
             dd = dt.find_next(['dd', 'td'])
             if dd:
                 div_text = dd.get_text(strip=True)
-                # 「192.00円」などのテキストから数値を抽出
                 div_match = re.search(r"([\d\.]+)", div_text)
                 if div_match:
                     dividend = float(div_match.group(1))
@@ -152,130 +140,116 @@ def read_root():
     return {"message": "Yield Watcher API is running. Use /api/stock?code=XXXX to fetch stock data."}
 
 @app.get("/api/stock", response_model=StockResponse)
-def get_stock(code: str = Query(..., description="銘柄コード (数字4桁、または末尾に.T付きのコード。例: 2914, 7203.T)")):
+def get_stock(code: str = Query(..., description="銘柄コード (英数字混じり対応。例: 2914, 135A, 7203.T)")):
     """
     指定された銘柄コードの最新株価と配当利回りを取得します。
-    フロントエンド（app.js）が要求する「yield」「changePercent」等の命名規則に完全に準拠して返却します。
+    日本語会社名の確実な取得と最新株価の正確性を担保するため、日本株に対してはYahoo!ファイナンス(日本)のスクレイピングを最優先とし、
+    失敗時やデータ欠損時は yfinance を使ってデータ補正を行います。
     """
-    # コードの正規化
+    # コードの正規化 (英数字のみ抽出し大文字化)
     code = code.strip().upper()
+    clean_code = re.sub(r"\.T$", "", code)
+    clean_code = re.sub(r"[^A-Z0-9]", "", clean_code)
     
-    # yfinance用の証券コード整形（日本株は末尾に .T が必要）
-    yf_code = code
-    if len(code) == 4 and code.isdigit():
-        yf_code = f"{code}.T"
-        
-    logger.info(f"Requested code: {code} (yfinance code: {yf_code})")
+    if not clean_code:
+        raise HTTPException(status_code=400, detail="無効な銘柄コードです。")
+
+    yf_code = f"{clean_code}.T"
+    logger.info(f"Processing code: {clean_code} (yfinance code: {yf_code})")
     
+    # 戻り値用ステートの初期化
     name = ""
     price = 0.0
     change = 0.0
     change_percent = 0.0
     dividend = 0.0
     dividend_yield = 0.0
-    source = "yfinance"
+    source = "scraping"
     
-    yfinance_success = False
+    # 1. 【最優先】Yahoo!ファイナンス（日本）のスクレイピングを実行 (日本語銘柄名・リアルタイム株価の取得)
+    scraped_price, scraped_dy, scraped_name, scraped_dividend = scrape_yahoo_finance_japan(clean_code)
     
-    # 1. yfinance からのデータ取得を試行
-    try:
-        ticker = yf.Ticker(yf_code)
-        info = ticker.info
-        
-        if info:
-            # 銘柄名
-            name = info.get("longName") or info.get("shortName") or ""
+    if scraped_price > 0.0:
+        price = scraped_price
+        dividend_yield = scraped_dy
+        name = scraped_name
+        dividend = scraped_dividend
+        logger.info(f"Successfully scraped data for {clean_code} (Name: {name})")
+    else:
+        logger.warning(f"Scraping failed or returned incomplete data for {clean_code}. Trying yfinance...")
+        source = "yfinance"
+
+    # 2. スクレイピング失敗時、またはデータの欠損（株価・利回りなど）がある場合に yfinance から補完
+    if price == 0.0 or dividend_yield == 0.0 or not name:
+        try:
+            ticker = yf.Ticker(yf_code)
+            info = ticker.info
             
-            # 株価の確実な取得（複数のキーを優先度順に確認）
-            for key in ["currentPrice", "regularMarketPrice", "previousClose", "open"]:
-                val = info.get(key)
-                if val is not None:
-                    try:
-                        price = float(val)
-                        break
-                    except ValueError:
-                        continue
-            
-            # 前日比・前日比％・1株配当
-            change = float(info.get("regularMarketChange") or 0.0)
-            change_percent = float(info.get("regularMarketChangePercent") or 0.0)
-            dividend = float(info.get("dividendRate") or 0.0)
-            
-            # 配当利回りの取得とクレンジング
-            dy = info.get("dividendYield")
-            if dy is not None:
-                try:
-                    dy_val = float(dy)
-                    
-                    # 単位・異常値の自動判定ロジック:
-                    # 一貫して「3.92」のようなパーセンテージ表記(float)に統一します。
-                    if dy_val == 0.0:
-                        dividend_yield = 0.0
-                    # A. 小数表記の場合 (例: 0.0392 -> 3.92%)
-                    elif dy_val < 0.2:
-                        dividend_yield = dy_val * 100
-                    # B. すでにパーセント表記の場合 (例: 3.92 -> 3.92%)
-                    elif dy_val < 20.0:
-                        dividend_yield = dy_val
-                    # C. 異常に大きな値の場合 (例: 192 や 392 など、配当金額そのものが混入している可能性)
-                    else:
-                        divided_val = dy_val / 100
-                        if divided_val < 20.0:
-                            dividend_yield = divided_val
-                        else:
-                            logger.warning(f"Abnormal dividend yield value from yfinance: {dy_val}. Forcing fallback.")
-                            dividend_yield = 0.0
+            if info:
+                # 英語名しか取れない場合は、yfinanceの名前をフォールバックとして採用
+                if not name:
+                    name = info.get("longName") or info.get("shortName") or ""
+                
+                # 株価がスクレイピングで取れなかった場合に補完
+                if price == 0.0:
+                    for key in ["currentPrice", "regularMarketPrice", "previousClose", "open"]:
+                        val = info.get(key)
+                        if val is not None:
+                            try:
+                                price = float(val)
+                                break
+                            except ValueError:
+                                continue
+                
+                # 前日比などの株価動向情報の取得
+                change = float(info.get("regularMarketChange") or 0.0)
+                change_percent = float(info.get("regularMarketChangePercent") or 0.0)
+                
+                # 1株配当金がスクレイピングで取れなかった場合に補完
+                if dividend == 0.0:
+                    dividend = float(info.get("dividendRate") or 0.0)
+                
+                # 配当利回りがスクレイピングで取れなかった場合に補完
+                if dividend_yield == 0.0:
+                    dy = info.get("dividendYield")
+                    if dy is not None:
+                        try:
+                            dy_val = float(dy)
                             
-                    # 最低限、株価が取得できており、配当利回りも正常範囲で取得できればyfinance成功と判定
-                    yfinance_success = (price > 0.0 and dividend_yield > 0.0)
-                except ValueError:
-                    pass
-    except Exception as e:
-        logger.error(f"yfinance lookup failed for {yf_code}: {e}")
-        
-    # 2. yfinanceでの取得が失敗、または配当利回りが 0.0（あるいは取得不可）の場合、スクレイピングによるフォールバックを実行
-    if not yfinance_success or price == 0.0 or dividend_yield == 0.0:
-        logger.info(f"Data incomplete or suspicious from yfinance. Attempting fallback scraping for {code}...")
-        scraped_price, scraped_dy, scraped_name, scraped_dividend = scrape_fallback(code)
-        
-        # 銘柄名の補完
-        if not name and scraped_name:
-            name = scraped_name
-            
-        # 株価の更新: スクレイピングで取れた最新の日本市場株価を優先
-        if scraped_price > 0.0:
-            price = scraped_price
-            source = "scraping"
-            
-        # 配当利回りの更新
-        if dividend_yield == 0.0 and scraped_dy > 0.0:
-            dividend_yield = scraped_dy
-            source = "scraping"
-            
-        # 1株配当金の更新
-        if dividend == 0.0 and scraped_dividend > 0.0:
-            dividend = scraped_dividend
+                            # 単位・異常値の自動判定ロジック:
+                            if dy_val == 0.0:
+                                dividend_yield = 0.0
+                            elif dy_val < 0.2:
+                                dividend_yield = dy_val * 100
+                            elif dy_val < 20.0:
+                                dividend_yield = dy_val
+                            else:
+                                divided_val = dy_val / 100
+                                if divided_val < 20.0:
+                                    dividend_yield = divided_val
+                        except ValueError:
+                            pass
+        except Exception as e:
+            logger.error(f"yfinance fallback lookup failed for {yf_code}: {e}")
 
     # 銘柄名がどうしても空の場合は仮の名称を設定
     if not name:
-        name = f"銘柄コード: {code.replace('.T', '')}"
+        name = f"銘柄コード: {clean_code}"
 
     # 株価がどうしても取得できなかった場合はエラーとする
     if price == 0.0:
         raise HTTPException(
             status_code=404, 
-            detail=f"銘柄コード {code} の株価データを取得できませんでした。コードが正しいか確認してください。"
+            detail=f"銘柄コード {clean_code} の株価データを取得できませんでした。コードが正しいか確認してください。"
         )
         
-    # float型であることを保証してレスポンススキーマに沿って返却
-    # 辞書のキー名は Pydantic の validation_alias にマッピングされます。
     return {
-        "code": code.replace(".T", ""),
+        "code": clean_code,
         "name": name,
         "price": float(price),
         "change": float(change),
         "changePercent": float(change_percent),
         "dividend": float(dividend),
-        "yield": float(dividend_yield),  # validation_alias により Pydantic モデルの yield_val にバインドされます
+        "yield": float(dividend_yield),
         "source": source
     }
